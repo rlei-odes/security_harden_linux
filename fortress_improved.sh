@@ -1,11 +1,22 @@
 #!/bin/bash
 
 # FORTRESS.SH - Linux Security Hardening Script
-# Version: 5.2 - Module Control & Scanner Compatibility Fixes
+# Version: 5.3 - Container/Turnkey LXC Compatibility
 # Author: captainzero93
 # GitHub: https://github.com/captainzero93/security_harden_linux
 # Optimized for Ubuntu 24.04+, Debian 13+
-# Last Updated: 2026-04-24
+# Last Updated: 2026-05-11
+#
+# MAJOR CHANGES IN v5.3:
+# - FIXED: Hard requirement on the `sudo` binary. Turnkey Linux LXC and
+#          other minimal containers run as root and ship without sudo, so
+#          every privileged call previously failed with "sudo: command not
+#          found". A single SUDO wrapper now resolves to "" when EUID=0 and
+#          to "sudo" otherwise, so the script works on both root containers
+#          and standard sudo-based hosts.
+# - IMPROVED: check_permissions() detects environment, primes the sudo
+#             timestamp once when needed, and prints a Turnkey-aware error
+#             when neither root nor sudo is available.
 #
 # MAJOR CHANGES IN v5.2:
 # - FIXED: -x/--disable and -e/--enable flags ignored (Issue #17)
@@ -40,7 +51,7 @@ set -euo pipefail
 # GLOBAL CONFIGURATION
 #=============================================================================
 
-readonly VERSION="5.2"
+readonly VERSION="5.3"
 readonly SCRIPT_NAME=$(basename "$0")
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly LOG_FILE="/var/log/fortress_hardening.log"
@@ -60,6 +71,14 @@ DISABLE_MODULES=""
 SECURITY_LEVEL="moderate"
 IS_DESKTOP=false
 CURRENT_MODULE=""
+
+# v5.3: Privilege escalation wrapper.
+# Turnkey Linux LXC containers (and many minimal containers) run as root and
+# don't ship sudo at all. Older versions hard-coded `sudo` everywhere, which
+# failed with "sudo: command not found" on those systems. We now resolve a
+# SUDO prefix once: empty when we're already root, "sudo" when not. Every
+# privileged command in this script runs as `${SUDO} <cmd>`.
+SUDO=""
 
 # v5.2: Track which values were set explicitly on the CLI so they properly
 # override fortress.conf (the v5.1 "compare to default" approach was broken:
@@ -174,7 +193,7 @@ log() {
     local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
     local log_entry="${timestamp} [${level}] [${CURRENT_MODULE:-SYSTEM}]: ${message}"
     
-    echo "${log_entry}" | sudo tee -a "${LOG_FILE}" >/dev/null 2>&1 || true
+    echo "${log_entry}" | ${SUDO} tee -a "${LOG_FILE}" >/dev/null 2>&1 || true
     
     case "${level}" in
         ERROR)
@@ -220,9 +239,29 @@ explain() {
 }
 
 check_permissions() {
-    if [[ "${EUID}" -ne 0 ]]; then
-        echo -e "${RED}This script must be run with sudo privileges.${NC}"
-        echo "Please run: sudo $0"
+    # v5.3: Resolve the SUDO prefix used by every privileged command.
+    # Order:
+    #   1) Already root (EUID 0)   -> SUDO=""    (covers Turnkey LXC / containers)
+    #   2) sudo available           -> SUDO="sudo"
+    #   3) Neither                  -> bail out with a useful message
+    if [[ "${EUID}" -eq 0 ]]; then
+        SUDO=""
+    elif command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+        # Prime the sudo timestamp so subsequent calls don't each prompt.
+        if ! sudo -n true 2>/dev/null; then
+            echo -e "${YELLOW}This script needs root. You'll be prompted for your sudo password.${NC}"
+            if ! sudo -v; then
+                echo -e "${RED}Failed to acquire sudo privileges.${NC}"
+                exit 1
+            fi
+        fi
+    else
+        echo -e "${RED}This script requires root privileges, but sudo is not installed${NC}"
+        echo -e "${RED}and you are not running as root (EUID=${EUID}).${NC}"
+        echo ""
+        echo "If you're on Turnkey LXC or a minimal container, log in as root and re-run:"
+        echo "  $0 $*"
         exit 1
     fi
 }
@@ -262,8 +301,8 @@ backup_file() {
     
     if [[ -f "${file}" ]]; then
         local backup_path="${BACKUP_DIR}${file}"
-        sudo mkdir -p "$(dirname "${backup_path}")"
-        sudo cp -a "${file}" "${backup_path}"
+        ${SUDO} mkdir -p "$(dirname "${backup_path}")"
+        ${SUDO} cp -a "${file}" "${backup_path}"
         log INFO "Backed up: ${file} → ${backup_path}"
     fi
 }
@@ -286,9 +325,9 @@ wait_for_apt() {
     local max_wait=300
     local waited=0
     
-    while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-          sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
-          sudo fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    while ${SUDO} fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+          ${SUDO} fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+          ${SUDO} fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
         
         if [[ ${waited} -eq 0 ]]; then
             log WARNING "Waiting for other package managers to finish..."
@@ -823,7 +862,7 @@ display_help() {
     cat << 'EOF'
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║                    FORTRESS.SH - Security Hardening                      ║
-║                         Version 5.2                                      ║
+║                         Version 5.3                                      ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 USAGE:
@@ -913,6 +952,11 @@ IMPORTANT NOTES:
     • This script cannot protect against kernel-level rootkits
     • Secure Boot verification is recommended but not automated
 
+NEW IN v5.3:
+    • FIXED: Works on Turnkey LXC / minimal containers without sudo.
+             Root execution is now first-class; sudo is only invoked when
+             both required (EUID != 0) and available.
+
 NEW IN v5.2:
     • FIXED: -x/--disable now strictly respected (Issue #17)
     • FIXED: CLI args now reliably override fortress.conf
@@ -977,14 +1021,14 @@ module_system_update() {
     wait_for_apt
     
     execute_command "Refreshing package lists" \
-        "sudo apt-get update"
+        "${SUDO} apt-get update"
     
     if [[ "${SECURITY_LEVEL}" == "paranoid" ]]; then
         execute_command "Upgrading all packages (full upgrade)" \
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y"
+            "${SUDO} DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y"
     else
         execute_command "Upgrading packages (safe upgrade)" \
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
+            "${SUDO} DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
     fi
     
     log SUCCESS "System packages updated"
@@ -1037,7 +1081,7 @@ module_ssh_hardening() {
                 [[ ! "${install_ssh}" =~ ^[Yy]$ ]] && return 0
 
                 execute_command "Installing OpenSSH server" \
-                    "sudo apt-get install -y openssh-server"
+                    "${SUDO} apt-get install -y openssh-server"
             else
                 return 0
             fi
@@ -1141,7 +1185,7 @@ module_ssh_hardening() {
         fi
         log INFO "Subsystem sftp -> ${sftp_server}"
 
-        sudo tee "${ssh_config}" > /dev/null << EOF
+        ${SUDO} tee "${ssh_config}" > /dev/null << EOF
 # FORTRESS.SH SSH Configuration v5.2
 # Strong security, key-based authentication only
 # Scanner mode: ${SCANNER_MODE}
@@ -1188,27 +1232,27 @@ EOF
 
         # Add allowed users if configured
         if [[ -n "${SSH_ALLOWED_USERS:-}" ]]; then
-            echo "AllowUsers ${SSH_ALLOWED_USERS//,/ }" | sudo tee -a "${ssh_config}" >/dev/null
+            echo "AllowUsers ${SSH_ALLOWED_USERS//,/ }" | ${SUDO} tee -a "${ssh_config}" >/dev/null
             log INFO "SSH restricted to users: ${SSH_ALLOWED_USERS}"
         fi
 
         # v5.2: Add allowed groups if configured
         if [[ -n "${SSH_ALLOWED_GROUPS:-}" ]]; then
-            echo "AllowGroups ${SSH_ALLOWED_GROUPS//,/ }" | sudo tee -a "${ssh_config}" >/dev/null
+            echo "AllowGroups ${SSH_ALLOWED_GROUPS//,/ }" | ${SUDO} tee -a "${ssh_config}" >/dev/null
             log INFO "SSH restricted to groups: ${SSH_ALLOWED_GROUPS}"
         fi
 
         # Validate configuration
-        if sudo sshd -t; then
+        if ${SUDO} sshd -t; then
             execute_command "Restarting SSH service" \
-                "sudo systemctl restart ssh 2>/dev/null || sudo systemctl restart sshd"
+                "${SUDO} systemctl restart ssh 2>/dev/null || ${SUDO} systemctl restart sshd"
             log SUCCESS "SSH hardened - password authentication disabled"
             if [[ "${SCANNER_MODE}" == "true" ]]; then
                 log INFO "Scanner-mode SSH: TCP fwd=${ssh_tcp_fwd}, agent fwd=${ssh_agent_fwd}, MaxSessions=${ssh_max_sessions}, kbd-int=${ssh_kbd}"
             fi
         else
             log ERROR "SSH configuration validation failed"
-            sudo cp "${BACKUP_DIR}${ssh_config}" "${ssh_config}"
+            ${SUDO} cp "${BACKUP_DIR}${ssh_config}" "${ssh_config}"
             return 1
         fi
     else
@@ -1295,7 +1339,7 @@ module_fail2ban() {
     
     # If we got here, either there are services that benefit, or user wants it anyway
     execute_command "Installing fail2ban" \
-        "sudo apt-get install -y fail2ban"
+        "${SUDO} apt-get install -y fail2ban"
     
     # Get fail2ban settings from config or use defaults
     local f2b_bantime="${FAIL2BAN_BANTIME:-3600}"
@@ -1310,7 +1354,7 @@ module_fail2ban() {
         local f2b_action="${FAIL2BAN_ACTION:-%(action_)s}"
 
         # Configure fail2ban based on what services are present
-        sudo tee /etc/fail2ban/jail.local > /dev/null << EOF
+        ${SUDO} tee /etc/fail2ban/jail.local > /dev/null << EOF
 [DEFAULT]
 bantime = ${f2b_bantime}
 findtime = ${f2b_findtime}
@@ -1326,7 +1370,7 @@ logpath = /var/log/auth.log
 EOF
 
         if [[ "${has_web_server}" == "true" ]]; then
-            sudo tee -a /etc/fail2ban/jail.local > /dev/null << 'EOF'
+            ${SUDO} tee -a /etc/fail2ban/jail.local > /dev/null << 'EOF'
 
 [nginx-http-auth]
 enabled = true
@@ -1342,7 +1386,7 @@ EOF
         fi
         
         execute_command "Enabling fail2ban" \
-            "sudo systemctl enable fail2ban && sudo systemctl restart fail2ban"
+            "${SUDO} systemctl enable fail2ban && ${SUDO} systemctl restart fail2ban"
         
         log SUCCESS "Fail2ban configured for detected services"
     fi
@@ -1406,7 +1450,7 @@ module_package_verification() {
             log INFO "Verification report: ${verify_report}"
             
             # Save to permanent location
-            sudo cp "${verify_report}" "/var/log/fortress_package_verification_$(date +%Y%m%d).txt"
+            ${SUDO} cp "${verify_report}" "/var/log/fortress_package_verification_$(date +%Y%m%d).txt"
             
             if [[ "${anomaly_count}" -gt 100 ]]; then
                 log WARNING "High number of anomalies - may indicate system issues"
@@ -1426,7 +1470,7 @@ module_package_verification() {
         
         # Create verification cron job
         local cron_script="/etc/cron.weekly/fortress-verify-packages"
-        sudo tee "${cron_script}" > /dev/null << 'CRONEOF'
+        ${SUDO} tee "${cron_script}" > /dev/null << 'CRONEOF'
 #!/bin/bash
 # FORTRESS.SH - Weekly package verification
 
@@ -1439,7 +1483,7 @@ if [[ -s "${REPORT}" ]]; then
 fi
 CRONEOF
         
-        sudo chmod +x "${cron_script}"
+        ${SUDO} chmod +x "${cron_script}"
         log SUCCESS "Weekly package verification cron job created"
     else
         log INFO "[DRY RUN] Would verify all package integrity"
@@ -1477,7 +1521,7 @@ module_firewall() {
     
     if ! command -v ufw &>/dev/null; then
         execute_command "Installing UFW" \
-            "sudo apt-get install -y ufw"
+            "${SUDO} apt-get install -y ufw"
     fi
     
     # Get firewall settings from config or use defaults
@@ -1487,26 +1531,26 @@ module_firewall() {
     if [[ "${DRY_RUN}" == "false" ]]; then
         # Reset UFW to clean state
         execute_command "Resetting UFW to defaults" \
-            "sudo ufw --force reset"
+            "${SUDO} ufw --force reset"
         
         # Default policies
-        sudo ufw default "${ufw_incoming}" incoming
-        sudo ufw default "${ufw_outgoing}" outgoing
-        sudo ufw default deny routed
+        ${SUDO} ufw default "${ufw_incoming}" incoming
+        ${SUDO} ufw default "${ufw_outgoing}" outgoing
+        ${SUDO} ufw default deny routed
         
         # Allow SSH (with rate limiting); Ubuntu uses unit "ssh", many others "sshd"
         local ufw_ssh_port="${SSH_PORT:-22}"
         if systemctl is-active --quiet ssh 2>/dev/null || \
            systemctl is-active --quiet sshd 2>/dev/null; then
-            sudo ufw limit "${ufw_ssh_port}/tcp" comment 'SSH with rate limiting'
+            ${SUDO} ufw limit "${ufw_ssh_port}/tcp" comment 'SSH with rate limiting'
             log INFO "SSH access allowed on port ${ufw_ssh_port} with rate limiting"
         fi
         
         # Allow common services if running
         if systemctl is-active --quiet apache2 2>/dev/null || \
            systemctl is-active --quiet nginx 2>/dev/null; then
-            sudo ufw allow http comment 'HTTP'
-            sudo ufw allow https comment 'HTTPS'
+            ${SUDO} ufw allow http comment 'HTTP'
+            ${SUDO} ufw allow https comment 'HTTPS'
             log INFO "Web server ports allowed (80, 443)"
         fi
         
@@ -1514,23 +1558,23 @@ module_firewall() {
         if [[ -n "${FIREWALL_ALLOW_PORTS:-}" ]]; then
             IFS=',' read -ra PORTS <<< "${FIREWALL_ALLOW_PORTS}"
             for port in "${PORTS[@]}"; do
-                sudo ufw allow "${port}/tcp" comment "Custom port ${port}"
+                ${SUDO} ufw allow "${port}/tcp" comment "Custom port ${port}"
                 log INFO "Allowed custom port: ${port}"
             done
         fi
         
         # Enable logging
-        sudo ufw logging low
+        ${SUDO} ufw logging low
         
         # Enable firewall
         execute_command "Enabling UFW firewall" \
-            "sudo ufw --force enable"
+            "${SUDO} ufw --force enable"
         
         log SUCCESS "UFW firewall configured and enabled"
         
         if [[ "${VERBOSE}" == "true" ]]; then
             echo ""
-            sudo ufw status verbose
+            ${SUDO} ufw status verbose
             echo ""
         fi
     else
@@ -1597,7 +1641,7 @@ net.bridge.bridge-nf-call-ip6tables = 1"
             log INFO "IP forwarding DISABLED (standard security)"
         fi
         
-        sudo tee "${sysctl_conf}" > /dev/null <<EOF
+        ${SUDO} tee "${sysctl_conf}" > /dev/null <<EOF
 # FORTRESS.SH v5.1 - Kernel Security Parameters
 # Generated: $(date)
 # Docker detected: ${DOCKER_DETECTED}
@@ -1647,14 +1691,14 @@ EOF
 
         # Apply custom sysctl parameters if configured
         if [[ -n "${SYSCTL_CUSTOM:-}" ]]; then
-            echo "" | sudo tee -a "${sysctl_conf}" >/dev/null
-            echo "# Custom sysctl parameters from fortress.conf" | sudo tee -a "${sysctl_conf}" >/dev/null
-            echo "${SYSCTL_CUSTOM}" | sudo tee -a "${sysctl_conf}" >/dev/null
+            echo "" | ${SUDO} tee -a "${sysctl_conf}" >/dev/null
+            echo "# Custom sysctl parameters from fortress.conf" | ${SUDO} tee -a "${sysctl_conf}" >/dev/null
+            echo "${SYSCTL_CUSTOM}" | ${SUDO} tee -a "${sysctl_conf}" >/dev/null
             log INFO "Applied custom sysctl parameters from configuration"
         fi
         
         execute_command "Applying kernel parameters" \
-            "sudo sysctl -p ${sysctl_conf} 2>/dev/null || true"
+            "${SUDO} sysctl -p ${sysctl_conf} 2>/dev/null || true"
         
         log SUCCESS "Kernel security parameters configured"
         
@@ -1704,8 +1748,8 @@ module_secure_shared_memory() {
     
     if [[ "${DRY_RUN}" == "false" ]]; then
         # Remove old entries if present
-        sudo sed -i '/\/dev\/shm/d' "${fstab}"
-        sudo sed -i '/\/run\/shm/d' "${fstab}"
+        ${SUDO} sed -i '/\/dev\/shm/d' "${fstab}"
+        ${SUDO} sed -i '/\/run\/shm/d' "${fstab}"
         
         # Determine mount options based on desktop/browser detection
         local mount_options="defaults,nodev,nosuid"
@@ -1726,12 +1770,12 @@ module_secure_shared_memory() {
         fi
         
         # Add hardened shared memory mounts
-        echo "tmpfs /dev/shm tmpfs ${mount_options} 0 0" | sudo tee -a "${fstab}" >/dev/null
-        echo "tmpfs /run/shm tmpfs ${mount_options} 0 0" | sudo tee -a "${fstab}" >/dev/null
+        echo "tmpfs /dev/shm tmpfs ${mount_options} 0 0" | ${SUDO} tee -a "${fstab}" >/dev/null
+        echo "tmpfs /run/shm tmpfs ${mount_options} 0 0" | ${SUDO} tee -a "${fstab}" >/dev/null
         
         # Remount immediately
         execute_command "Remounting /dev/shm with security options" \
-            "sudo mount -o remount,${mount_options} /dev/shm 2>/dev/null || true"
+            "${SUDO} mount -o remount,${mount_options} /dev/shm 2>/dev/null || true"
         
         log SUCCESS "Shared memory secured with options: ${mount_options}"
     else
@@ -1774,7 +1818,7 @@ module_password_policy() {
         "  • But ideally, use keys not passwords"
     
     execute_command "Installing password quality tools" \
-        "sudo apt-get install -y libpam-pwquality"
+        "${SUDO} apt-get install -y libpam-pwquality"
     
     local pwquality_conf="/etc/security/pwquality.conf"
     backup_file "${pwquality_conf}"
@@ -1784,7 +1828,7 @@ module_password_policy() {
     local pw_history="${PASSWORD_HISTORY:-5}"
     
     if [[ "${DRY_RUN}" == "false" ]]; then
-        sudo tee "${pwquality_conf}" > /dev/null << EOF
+        ${SUDO} tee "${pwquality_conf}" > /dev/null << EOF
 # FORTRESS.SH v5.1 - Password Quality Requirements
 
 # Minimum password length
@@ -1858,12 +1902,12 @@ module_audit() {
         "  • Alert on specific patterns"
     
     execute_command "Installing auditd" \
-        "sudo apt-get install -y auditd && sudo apt-get install -y audispd-plugins 2>/dev/null || true"
+        "${SUDO} apt-get install -y auditd && ${SUDO} apt-get install -y audispd-plugins 2>/dev/null || true"
     
     local audit_rules="/etc/audit/rules.d/fortress.rules"
     
     if [[ "${DRY_RUN}" == "false" ]]; then
-        sudo tee "${audit_rules}" > /dev/null << 'EOF'
+        ${SUDO} tee "${audit_rules}" > /dev/null << 'EOF'
 # FORTRESS.SH v5.1 - Audit Rules
 
 # Delete all existing rules
@@ -1922,10 +1966,10 @@ module_audit() {
 EOF
         
         execute_command "Loading audit rules" \
-            "sudo augenrules --load"
+            "${SUDO} augenrules --load"
         
         execute_command "Enabling auditd" \
-            "sudo systemctl enable auditd && sudo systemctl restart auditd"
+            "${SUDO} systemctl enable auditd && ${SUDO} systemctl restart auditd"
         
         log SUCCESS "Audit logging configured"
     else
@@ -1971,7 +2015,7 @@ module_automatic_updates() {
         "  • Monitor for update-related issues"
     
     execute_command "Installing unattended-upgrades" \
-        "sudo apt-get install -y unattended-upgrades apt-listchanges"
+        "${SUDO} apt-get install -y unattended-upgrades apt-listchanges"
     
     local auto_upgrades="/etc/apt/apt.conf.d/20auto-upgrades"
     local unattended_conf="/etc/apt/apt.conf.d/50unattended-upgrades"
@@ -1981,7 +2025,7 @@ module_automatic_updates() {
     local reboot_time="${AUTO_REBOOT_TIME:-03:00}"
     
     if [[ "${DRY_RUN}" == "false" ]]; then
-        sudo tee "${auto_upgrades}" > /dev/null << 'EOF'
+        ${SUDO} tee "${auto_upgrades}" > /dev/null << 'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
@@ -1989,7 +2033,7 @@ APT::Periodic::Unattended-Upgrade "1";
 EOF
         
         # Configure unattended upgrades
-        sudo tee "${unattended_conf}" > /dev/null << EOF
+        ${SUDO} tee "${unattended_conf}" > /dev/null << EOF
 Unattended-Upgrade::Allowed-Origins {
     "\${distro_id}:\${distro_codename}-security";
     "\${distro_id}ESMApps:\${distro_codename}-apps-security";
@@ -2005,7 +2049,7 @@ Unattended-Upgrade::Automatic-Reboot-Time "${reboot_time}";
 EOF
         
         execute_command "Enabling automatic updates" \
-            "sudo systemctl enable unattended-upgrades && sudo systemctl start unattended-upgrades"
+            "${SUDO} systemctl enable unattended-upgrades && ${SUDO} systemctl start unattended-upgrades"
         
         log SUCCESS "Automatic security updates enabled"
     else
@@ -2041,11 +2085,11 @@ module_ntp() {
         log INFO "Time synchronization already active"
     else
         execute_command "Enabling systemd-timesyncd" \
-            "sudo systemctl enable systemd-timesyncd && sudo systemctl start systemd-timesyncd"
+            "${SUDO} systemctl enable systemd-timesyncd && ${SUDO} systemctl start systemd-timesyncd"
     fi
     
     if [[ "${DRY_RUN}" == "false" ]]; then
-        sudo timedatectl set-ntp true
+        ${SUDO} timedatectl set-ntp true
         log SUCCESS "Time synchronization enabled"
         
         if [[ "${VERBOSE}" == "true" ]]; then
@@ -2089,21 +2133,21 @@ module_apparmor() {
         "  • Security benefit is substantial"
     
     execute_command "Installing AppArmor utilities" \
-        "sudo apt-get install -y apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra"
+        "${SUDO} apt-get install -y apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra"
     
     if [[ "${DRY_RUN}" == "false" ]]; then
         # Enable AppArmor
         execute_command "Enabling AppArmor" \
-            "sudo systemctl enable apparmor && sudo systemctl start apparmor"
+            "${SUDO} systemctl enable apparmor && ${SUDO} systemctl start apparmor"
         
         # Set all profiles to enforce mode
-        sudo aa-enforce /etc/apparmor.d/* 2>/dev/null || true
+        ${SUDO} aa-enforce /etc/apparmor.d/* 2>/dev/null || true
         
         log SUCCESS "AppArmor configured and enforcing"
         
         if [[ "${VERBOSE}" == "true" ]]; then
             echo ""
-            sudo aa-status
+            ${SUDO} aa-status
             echo ""
         fi
     else
@@ -2168,7 +2212,7 @@ module_boot_security() {
             fi
         else
             execute_command "Installing mokutil for Secure Boot checking" \
-                "sudo apt-get install -y mokutil"
+                "${SUDO} apt-get install -y mokutil"
         fi
     else
         log INFO "Legacy BIOS detected - Secure Boot not available"
@@ -2191,7 +2235,7 @@ module_boot_security() {
             grub_hash=$(echo "${grub_hash_output}" | grep 'grub.pbkdf2' | awk '{print $NF}')
             
             if [[ -n "${grub_hash}" ]]; then
-                sudo tee /etc/grub.d/40_custom_password > /dev/null << GRUBEOF
+                ${SUDO} tee /etc/grub.d/40_custom_password > /dev/null << GRUBEOF
 #!/bin/sh
 cat << GRUBCFG
 set superusers="root"
@@ -2199,9 +2243,9 @@ password_pbkdf2 root ${grub_hash}
 GRUBCFG
 GRUBEOF
                 
-                sudo chmod +x /etc/grub.d/40_custom_password
+                ${SUDO} chmod +x /etc/grub.d/40_custom_password
                 execute_command "Updating GRUB configuration" \
-                    "sudo update-grub"
+                    "${SUDO} update-grub"
                 
                 log SUCCESS "GRUB password set - boot parameters now protected"
             else
@@ -2240,7 +2284,7 @@ module_root_access() {
     if [[ "${DRY_RUN}" == "false" ]]; then
         # Lock root account
         execute_command "Disabling direct root login" \
-            "sudo passwd -l root"
+            "${SUDO} passwd -l root"
         
         log SUCCESS "Direct root login disabled - use sudo instead"
     else
@@ -2306,10 +2350,10 @@ module_packages() {
             
             if [[ "${remove_pkgs}" =~ ^[Yy]$ ]]; then
                 execute_command "Removing unnecessary packages" \
-                    "sudo apt-get remove -y ${found_packages[*]}"
+                    "${SUDO} apt-get remove -y ${found_packages[*]}"
                 
                 execute_command "Cleaning up" \
-                    "sudo apt-get autoremove -y"
+                    "${SUDO} apt-get autoremove -y"
             fi
         fi
     else
@@ -2359,7 +2403,7 @@ module_usb_protection() {
     local udev_rule="/etc/udev/rules.d/99-fortress-usb.rules"
     
     if [[ "${DRY_RUN}" == "false" ]]; then
-        sudo tee "${udev_rule}" > /dev/null << 'EOF'
+        ${SUDO} tee "${udev_rule}" > /dev/null << 'EOF'
 # FORTRESS.SH v5.1 - USB Device Protection
 # Prevent unauthorized USB storage devices
 
@@ -2376,13 +2420,13 @@ EOF
             for device in "${USB_DEVS[@]}"; do
                 local vendor="${device%%:*}"
                 local product="${device##*:}"
-                echo "SUBSYSTEM==\"usb\", ATTR{idVendor}==\"${vendor}\", ATTR{idProduct}==\"${product}\", MODE=\"0660\"" | sudo tee -a "${udev_rule}" >/dev/null
+                echo "SUBSYSTEM==\"usb\", ATTR{idVendor}==\"${vendor}\", ATTR{idProduct}==\"${product}\", MODE=\"0660\"" | ${SUDO} tee -a "${udev_rule}" >/dev/null
                 log INFO "Whitelisted USB device: ${vendor}:${product}"
             done
         fi
         
         execute_command "Reloading udev rules" \
-            "sudo udevadm control --reload-rules && sudo udevadm trigger"
+            "${SUDO} udevadm control --reload-rules && ${SUDO} udevadm trigger"
         
         log SUCCESS "USB storage protection enabled"
         log INFO "To whitelist specific USB devices, edit: ${udev_rule}"
@@ -2418,7 +2462,7 @@ module_filesystems() {
     local modprobe_conf="/etc/modprobe.d/fortress-filesystems.conf"
     
     if [[ "${DRY_RUN}" == "false" ]]; then
-        sudo tee "${modprobe_conf}" > /dev/null << 'EOF'
+        ${SUDO} tee "${modprobe_conf}" > /dev/null << 'EOF'
 # FORTRESS.SH v5.1 - Disable Unused Filesystems
 
 install cramfs /bin/true
@@ -2710,7 +2754,7 @@ generate_report() {
         compat_info="${compat_info}<p><strong>Browsers:</strong> ${DETECTED_BROWSERS[*]} - /dev/shm noexec skipped: ${ALLOW_BROWSER_SHAREDMEM}</p>"
     fi
     
-    sudo tee "${REPORT_FILE}" > /dev/null << EOF
+    ${SUDO} tee "${REPORT_FILE}" > /dev/null << EOF
 <!DOCTYPE html>
 <html>
 <head>
@@ -2839,7 +2883,7 @@ generate_report() {
 </html>
 EOF
     
-    sudo chmod 600 "${REPORT_FILE}"
+    ${SUDO} chmod 600 "${REPORT_FILE}"
     log SUCCESS "Report generated: ${REPORT_FILE}"
 }
 
@@ -2996,12 +3040,12 @@ main() {
     prompt_browser_compatibility
     
     # Create log file
-    sudo touch "${LOG_FILE}"
-    sudo chmod 640 "${LOG_FILE}"
+    ${SUDO} touch "${LOG_FILE}"
+    ${SUDO} chmod 640 "${LOG_FILE}"
     
     # Create backup directory
     if [[ "${DRY_RUN}" == "false" ]]; then
-        sudo mkdir -p "${BACKUP_DIR}"
+        ${SUDO} mkdir -p "${BACKUP_DIR}"
         log INFO "Backup directory: ${BACKUP_DIR}"
     fi
     
@@ -3057,7 +3101,7 @@ main() {
     
     if [[ "${DRY_RUN}" == "false" ]] && [[ "${INTERACTIVE}" == "true" ]]; then
         read -p "Restart recommended to apply all changes. Restart now? (y/N): " -r restart
-        [[ "${restart}" =~ ^[Yy]$ ]] && sudo reboot
+        [[ "${restart}" =~ ^[Yy]$ ]] && ${SUDO} reboot
     fi
 }
 
