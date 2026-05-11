@@ -2257,9 +2257,100 @@ GRUBEOF
     return 0
 }
 
+find_sudo_users() {
+    # Print every non-root account that can obtain root via sudo.
+    # Membership in sudo/wheel/admin is the portable signal across Debian/RHEL/Arch.
+    local groups=(sudo wheel admin)
+    local users=()
+
+    for g in "${groups[@]}"; do
+        if getent group "${g}" >/dev/null 2>&1; then
+            local members
+            members="$(getent group "${g}" | awk -F: '{print $4}')"
+            IFS=',' read -ra arr <<< "${members}"
+            for u in "${arr[@]}"; do
+                [[ -z "${u}" || "${u}" == "root" ]] && continue
+                users+=("${u}")
+            done
+        fi
+    done
+
+    printf '%s\n' "${users[@]}" | sort -u
+}
+
+create_sudo_user_interactive() {
+    # Prompt for a new username, create the account, set a password,
+    # and add to the sudo group. Returns 0 on success, 1 on failure/abort.
+    local new_user
+    local sudo_group="sudo"
+
+    # RHEL/CentOS/Fedora use "wheel" instead of "sudo".
+    if ! getent group sudo >/dev/null 2>&1 && getent group wheel >/dev/null 2>&1; then
+        sudo_group="wheel"
+    fi
+
+    echo ""
+    echo -e "${CYAN}Creating a sudo-capable user account.${NC}"
+    echo "This user will be added to the '${sudo_group}' group."
+    echo ""
+
+    while true; do
+        read -p "Enter username for new sudo user (or 'abort' to cancel): " -r new_user
+
+        if [[ "${new_user}" == "abort" || -z "${new_user}" ]]; then
+            log WARNING "Sudo user creation aborted by user"
+            return 1
+        fi
+
+        # POSIX-ish username validation: lowercase, digits, _ and -, must start with letter or _
+        if [[ ! "${new_user}" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            echo -e "${RED}Invalid username. Use lowercase letters, digits, '_' or '-'.${NC}"
+            continue
+        fi
+
+        if id "${new_user}" >/dev/null 2>&1; then
+            echo -e "${YELLOW}User '${new_user}' already exists.${NC}"
+            read -p "Add existing user to '${sudo_group}' group instead? (y/N): " -r add_existing
+            if [[ "${add_existing}" =~ ^[Yy]$ ]]; then
+                if ${SUDO} usermod -aG "${sudo_group}" "${new_user}"; then
+                    log SUCCESS "Added '${new_user}' to '${sudo_group}' group"
+                    return 0
+                else
+                    log ERROR "Failed to add '${new_user}' to '${sudo_group}'"
+                    return 1
+                fi
+            fi
+            continue
+        fi
+
+        break
+    done
+
+    if ! ${SUDO} useradd -m -s /bin/bash "${new_user}"; then
+        log ERROR "Failed to create user '${new_user}'"
+        return 1
+    fi
+
+    if ! ${SUDO} usermod -aG "${sudo_group}" "${new_user}"; then
+        log ERROR "Failed to add '${new_user}' to '${sudo_group}' group"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${YELLOW}Set a password for '${new_user}':${NC}"
+    if ! ${SUDO} passwd "${new_user}"; then
+        log ERROR "Password setup failed - user created but has no password"
+        log ERROR "Run '${SUDO} passwd ${new_user}' manually before disabling root"
+        return 1
+    fi
+
+    log SUCCESS "Created sudo user '${new_user}' in '${sudo_group}' group"
+    return 0
+}
+
 module_root_access() {
     CURRENT_MODULE="root_access"
-    
+
     explain "Disable Direct Root Login" \
         "Force use of sudo instead of direct root login." \
         "" \
@@ -2280,17 +2371,115 @@ module_root_access() {
         "  • All root actions are traceable to specific users" \
         "" \
         "This is reversible by setting root password again."
-    
+
+    # Lockout-prevention check #1: sudo binary must exist.
+    # Without sudo, "sudo group membership" grants nothing — locking root would
+    # leave no path to administrative access, even for users in sudo/wheel.
+    if ! command -v sudo >/dev/null 2>&1; then
+        log WARNING "sudo binary not installed on this system"
+        echo ""
+        echo -e "${YELLOW}⚠️  LOCKOUT RISK - sudo not installed${NC}"
+        echo "Group membership in 'sudo'/'wheel' is meaningless without the sudo"
+        echo "binary. Locking root now would remove all administrative access."
+        echo ""
+
+        if [[ "${INTERACTIVE}" != "true" ]]; then
+            log ERROR "Skipping root lockdown: sudo not installed and non-interactive mode"
+            return 1
+        fi
+
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            log INFO "[DRY RUN] Would offer to install sudo before disabling root"
+            return 0
+        fi
+
+        read -p "Install sudo now? (Y/n): " -r install_sudo
+        if [[ "${install_sudo}" =~ ^[Nn]$ ]]; then
+            log WARNING "Skipping root lockdown - sudo unavailable"
+            return 0
+        fi
+
+        # Install via available package manager. SUDO is empty here (we're root,
+        # else check_permissions would have already aborted).
+        local pm_ok=false
+        if command -v apt-get >/dev/null 2>&1; then
+            wait_for_apt && ${SUDO} apt-get install -y sudo && pm_ok=true
+        elif command -v dnf >/dev/null 2>&1; then
+            ${SUDO} dnf install -y sudo && pm_ok=true
+        elif command -v yum >/dev/null 2>&1; then
+            ${SUDO} yum install -y sudo && pm_ok=true
+        elif command -v pacman >/dev/null 2>&1; then
+            ${SUDO} pacman -S --noconfirm sudo && pm_ok=true
+        elif command -v apk >/dev/null 2>&1; then
+            ${SUDO} apk add sudo && pm_ok=true
+        else
+            log ERROR "No supported package manager found to install sudo"
+        fi
+
+        if [[ "${pm_ok}" != "true" ]] || ! command -v sudo >/dev/null 2>&1; then
+            log ERROR "Skipping root lockdown - sudo install failed"
+            return 1
+        fi
+
+        log SUCCESS "sudo installed"
+    fi
+
+    # Lockout-prevention check #2: a non-root sudo user must exist.
+    local sudo_users
+    sudo_users="$(find_sudo_users)"
+
+    if [[ -z "${sudo_users}" ]]; then
+        log WARNING "No non-root sudo user found on this system"
+        echo ""
+        echo -e "${YELLOW}⚠️  LOCKOUT RISK${NC}"
+        echo "Disabling the root account without a sudo-capable user would lock"
+        echo "you out of administrative access entirely."
+        echo ""
+
+        if [[ "${INTERACTIVE}" != "true" ]]; then
+            log ERROR "Skipping root lockdown: no sudo user exists and non-interactive mode"
+            log ERROR "Create a sudo user manually, then re-run this module"
+            return 1
+        fi
+
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            log INFO "[DRY RUN] Would prompt to create a sudo user before disabling root"
+            return 0
+        fi
+
+        read -p "Create a sudo user now? (Y/n): " -r create_now
+        if [[ "${create_now}" =~ ^[Nn]$ ]]; then
+            log WARNING "Skipping root lockdown - no sudo user available"
+            return 0
+        fi
+
+        if ! create_sudo_user_interactive; then
+            log ERROR "Skipping root lockdown - sudo user not created"
+            return 1
+        fi
+
+        sudo_users="$(find_sudo_users)"
+        if [[ -z "${sudo_users}" ]]; then
+            log ERROR "Verification failed: still no sudo user detected, aborting root lockdown"
+            return 1
+        fi
+    fi
+
+    log INFO "Sudo-capable user(s) detected:"
+    while IFS= read -r u; do
+        [[ -n "${u}" ]] && echo "  - ${u}"
+    done <<< "${sudo_users}"
+
     if [[ "${DRY_RUN}" == "false" ]]; then
         # Lock root account
         execute_command "Disabling direct root login" \
             "${SUDO} passwd -l root"
-        
+
         log SUCCESS "Direct root login disabled - use sudo instead"
     else
         log INFO "[DRY RUN] Would disable direct root login"
     fi
-    
+
     return 0
 }
 
