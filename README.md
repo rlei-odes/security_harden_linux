@@ -1,5 +1,7 @@
 # FORTRESS.SH :: Debian Linux Defence Configuration
 
+NOTICE: Fix Permissions .sh was causing issues on some systems it's been removed for now, the newer versions should already have fixed the issues that script attempted to.
+
 **One-command security hardening that implements enterprise-grade protections (DISA STIG + CIS) while letting you decide the level of protection vs usability trade-off. Casual desktop use through to strict server enforcement.**
 
 **Version 5.3** — Container/Turnkey LXC compatibility. The script no longer hard-requires the `sudo` binary, so it runs cleanly on Turnkey Linux LXC and other minimal root containers where `sudo` isn't installed. Everything from v5.2 (the `-x`/`--disable` fix, `--scanner-mode`, CLI/config precedence, sftp-server detection) is unchanged. Tested on Debian 13, Ubuntu 24.04+, and Turnkey Core LXC.
