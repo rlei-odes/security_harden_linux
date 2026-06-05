@@ -2,7 +2,7 @@
 
 **One-command security hardening that implements enterprise-grade protections (DISA STIG + CIS) while letting you decide the level of protection vs usability trade-off. Casual desktop use through to strict server enforcement.**
 
-**Version 5.2** - Module Control & Scanner Compatibility: fixed `-x`/`--disable` (Issue #17), added `--scanner-mode` for Nessus/CIS credentialed scans, fixed bugs in CLI/config precedence and the verify script. Tested for Debian 13, Ubuntu 24.04+.
+**Version 5.3** — Container/Turnkey LXC compatibility. The script no longer hard-requires the `sudo` binary, so it runs cleanly on Turnkey Linux LXC and other minimal root containers where `sudo` isn't installed. Everything from v5.2 (the `-x`/`--disable` fix, `--scanner-mode`, CLI/config precedence, sftp-server detection) is unchanged. Tested on Debian 13, Ubuntu 24.04+, and Turnkey Core LXC.
 
 [![License](https://img.shields.io/badge/License-CC%20BY--NC%204.0-blue.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%2B-orange.svg)](https://ubuntu.com/)
@@ -10,7 +10,7 @@
 [![Debian](https://img.shields.io/badge/Debian-11%2B%20%7C%2013-red.svg)](https://www.debian.org/)
 [![Linux Mint](https://img.shields.io/badge/Linux%20Mint-21%2B-87CF3E.svg)](https://linuxmint.com/)
 [![Pop!\_OS](https://img.shields.io/badge/Pop!__OS-22.04%2B-48B9C7.svg)](https://pop.system76.com/)
-[![Version](https://img.shields.io/badge/Version-5.2-green.svg)]()
+[![Version](https://img.shields.io/badge/Version-5.3-green.svg)]()
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/captainzero)
 
@@ -20,7 +20,7 @@
 
 **Set up SSH keys FIRST or you WILL be locked out.**
 
-v5.2 keeps all the safety checks from v5.1 (explicit "yes" confirmation, automatic config validation, rollback on sshd syntax error) but you still need working key-based authentication before running the script. See [Critical Warning for Remote Servers](#critical-warning-for-remote-servers) for full setup instructions.
+v5.3 keeps all the safety checks from v5.1/v5.2 (explicit "yes" confirmation, automatic config validation, rollback on sshd syntax error) but you still need working key-based authentication before running the script. See [Critical Warning for Remote Servers](#critical-warning-for-remote-servers) for full setup instructions.
 
 ### Notice
 
@@ -29,6 +29,8 @@ This script handles network/system hardening, AppArmor (not SELinux), audit logg
 ---
 
 ## Quick Start
+
+> **Note on `sudo`:** every example below uses `sudo ./fortress_improved.sh` because that's the common case. If you're on a Turnkey LXC container (or any environment where you're already root and `sudo` isn't installed) just drop the `sudo` — `./fortress_improved.sh` works the same way. The script detects this at startup and won't complain.
 
 ### Desktop Users:
 
@@ -55,6 +57,15 @@ ssh-copy-id user@your-server
 
 # Then run hardening
 sudo ./fortress_improved.sh -l high -n
+```
+
+### Turnkey LXC / Root Containers:
+
+```bash
+# Already root, no sudo binary - just run it directly
+wget https://raw.githubusercontent.com/captainzero93/security_harden_linux/main/fortress_improved.sh
+chmod +x fortress_improved.sh
+./fortress_improved.sh -l moderate
 ```
 
 **Something broke?** Restore from backup directory: `/root/fortress_backups_*/`
@@ -218,6 +229,26 @@ Someone boots your computer from USB, mounts your drive, and steals everything.
 ---
 
 ## What's New
+
+### v5.3 — Container / Turnkey LXC Compatibility
+
+A small, targeted release. v5.2 had a hidden assumption baked into every privileged call — that `sudo` exists on the system. On a normal Debian/Ubuntu install that's fine, but on Turnkey Linux LXC containers (and a lot of other minimal containers) you log in as root and `sudo` isn't installed. The script blew up on the first `sudo apt-get update` with `sudo: command not found`.
+
+**Fixed:**
+
+* **The `sudo` dependency.** Every privileged command now goes through a single `${SUDO}` wrapper that's resolved once at startup. If you're already root (`EUID=0`), it's empty and commands run directly. If you're not root but `sudo` exists, it's set to `sudo` and the script primes the timestamp once so you don't get prompted twelve times during the run. If neither applies, the script bails out early with a Turnkey-aware error message instead of failing halfway through hardening.
+* **`check_permissions()`** no longer just refuses to run unless you typed `sudo` — it actually checks what privilege model is available and adapts.
+
+**Nothing else changed.** All the v5.2 behaviour (`-x`/`--disable` semantics, `--scanner-mode`, CLI vs config precedence, sftp-server probing, `kernel.yama.ptrace_scope`, the verify script fixes) is unchanged. If v5.2 already worked for you, v5.3 is a drop-in replacement.
+
+**Where this matters:**
+
+* Turnkey Core / Turnkey Fileserver / Turnkey LXC images
+* Proxmox LXC containers built from a minimal Debian template
+* Stripped-down Docker containers used for testing the script
+* Any chroot or container where you're root and `sudo` was never installed
+
+If you're on a normal desktop or server with `sudo` set up the usual way, you won't notice any difference.
 
 ### v5.2 - Module Control & Scanner Compatibility
 
@@ -940,8 +971,8 @@ chmod +x fortress_improved.sh
 
 ### Minimum:
 
-* **OS:** Debian-based Linux (Ubuntu, Debian, Mint, Pop, Kubuntu)
-* **Access:** Root or sudo privileges
+* **OS:** Debian-based Linux (Ubuntu, Debian, Mint, Pop, Kubuntu, Turnkey)
+* **Access:** Root, or a user with `sudo` configured. As of v5.3, `sudo` does not need to be installed if you're already root — that covers Turnkey LXC and similar minimal containers.
 * **Internet:** Required for downloading packages
 * **Disk:** ~500MB free space (for backups and new packages)
 * **RAM:** No additional requirement
@@ -955,10 +986,11 @@ chmod +x fortress_improved.sh
 
 ### Incompatible With:
 
-* Non-Debian distributions (Fedora, Arch, etc.)
+* Non-Debian distributions (Fedora, Arch, etc.) — package manager assumptions don't translate
 * Extremely old systems (Debian < 11)
 * Systems with conflicting security tools
-* Docker containers (limited functionality)
+
+LXC containers (including Turnkey Core) work as of v5.3. Plain Docker containers are still a poor fit — auditd, AppArmor, sysctl writes, and modprobe blacklists don't really apply inside an unprivileged Docker container, and several modules will skip or fail. Use `--dry-run` first if you're trying it.
 
 ---
 
@@ -993,6 +1025,10 @@ For commercial licensing, email: cyberjunk77@protonmail.com with subject "Commer
 ---
 
 ## Version History
+
+### v5.3 (2026-05) — Container / Turnkey LXC Compatibility
+
+Removed the hard dependency on the `sudo` binary. The script now resolves a `${SUDO}` prefix once at startup: empty when running as root (Turnkey LXC, root containers, recovery shells), `sudo` otherwise. Updated `check_permissions()` to detect the environment and bail out with a Turnkey-aware error if neither root nor `sudo` is available. All v5.2 behaviour is preserved unchanged.
 
 ### v5.2 (2026-04) - Module Control & Scanner Compatibility
 
@@ -1120,7 +1156,7 @@ For commercial licensing, professional support, or consulting services: [cyberju
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                    FORTRESS.SH QUICK REFERENCE v5.2
+                    FORTRESS.SH QUICK REFERENCE v5.3
 
 ESSENTIAL COMMANDS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1205,7 +1241,7 @@ Issues:       https://github.com/captainzero93/security_harden_linux/issues
 
 **Star this repo if it helped you.**
 
-**Version:** 5.1 | **Author:** captainzero93 |
+**Version:** 5.3 | **Author:** captainzero93 |
 
 **GitHub:** https://github.com/captainzero93/
 
