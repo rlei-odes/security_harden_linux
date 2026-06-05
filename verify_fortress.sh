@@ -262,7 +262,7 @@ if command -v aa-status >/dev/null 2>&1; then
     if systemctl is-active --quiet apparmor 2>/dev/null; then
         echo -e "  ${GREEN}✓${NC} AppArmor service is running"
         PASSED=$((PASSED + 1))
-        
+
         PROFILES=$(aa-status 2>/dev/null | grep "profiles are in enforce mode" | awk '{print $1}')
         if [[ -n "$PROFILES" ]] && [[ "$PROFILES" -gt 0 ]]; then
             echo -e "  ${GREEN}✓${NC} $PROFILES profiles in enforce mode"
@@ -270,6 +270,31 @@ if command -v aa-status >/dev/null 2>&1; then
         else
             echo -e "  ${YELLOW}⚠${NC} No profiles in enforce mode"
             WARNINGS=$((WARNINGS + 1))
+        fi
+
+        # Scan for recent AppArmor denials — indicates a profile is blocking
+        # an application path it wasn't configured to allow.
+        if command -v journalctl >/dev/null 2>&1; then
+            DENIAL_LOG=$(journalctl -k --no-pager -q 2>/dev/null | grep 'apparmor="DENIED"' | tail -30)
+        else
+            DENIAL_LOG=$(dmesg 2>/dev/null | grep 'apparmor="DENIED"' | tail -30)
+        fi
+
+        if [[ -n "$DENIAL_LOG" ]]; then
+            echo -e "  ${YELLOW}⚠${NC} AppArmor denials detected — one or more applications may be broken:"
+            echo "$DENIAL_LOG" | grep -oP 'profile="[^"]+"' | sort -u | \
+            while IFS= read -r prof; do
+                profile_name="${prof#profile=\"}"
+                profile_name="${profile_name%\"}"
+                echo -e "      ${YELLOW}→${NC} ${profile_name}"
+            done
+            echo -e "      Full denial log:  sudo journalctl -k | grep apparmor"
+            echo -e "      Revert a profile: sudo aa-complain /etc/apparmor.d/<name>"
+            echo -e "      Then restart the affected service: sudo systemctl restart <service>"
+            WARNINGS=$((WARNINGS + 1))
+        else
+            echo -e "  ${GREEN}✓${NC} No AppArmor denials in kernel log"
+            PASSED=$((PASSED + 1))
         fi
     else
         echo -e "  ${YELLOW}⚠${NC} AppArmor service not running"

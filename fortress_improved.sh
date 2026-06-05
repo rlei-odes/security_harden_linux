@@ -2096,11 +2096,36 @@ module_apparmor() {
         execute_command "Enabling AppArmor" \
             "sudo systemctl enable apparmor && sudo systemctl start apparmor"
         
+        # Collect profiles the distro shipped in complain mode — these are
+        # deliberately unconstrained because they need site-specific tuning.
+        # We still enforce everything (maximum protection), but we surface the
+        # list so users know which profiles are most likely to conflict with
+        # their applications (PHP runtimes, databases, etc.).
+        local complain_before=()
+        for profile in /etc/apparmor.d/*; do
+            [[ -f "$profile" ]] || continue
+            grep -q 'flags=(complain)' "$profile" 2>/dev/null && \
+                complain_before+=("$(basename "$profile")")
+        done
+
         # Set all profiles to enforce mode
         sudo aa-enforce /etc/apparmor.d/* 2>/dev/null || true
-        
+
         log SUCCESS "AppArmor configured and enforcing"
-        
+
+        if [[ ${#complain_before[@]} -gt 0 ]]; then
+            log WARNING "The following profiles were in complain mode and are now enforcing:"
+            for p in "${complain_before[@]}"; do
+                log WARNING "  • ${p}"
+            done
+            log WARNING "These profiles may block application-specific paths (PHP apps, databases, etc.)."
+            log WARNING "If an application breaks, check for denials and revert the relevant profile:"
+            log WARNING "  sudo journalctl -k | grep apparmor"
+            log WARNING "  sudo aa-complain /etc/apparmor.d/<profile-name>"
+            log WARNING "  sudo systemctl restart <service>"
+            log WARNING "Run verify_fortress.sh to scan for active AppArmor denials."
+        fi
+
         if [[ "${VERBOSE}" == "true" ]]; then
             echo ""
             sudo aa-status
@@ -2108,6 +2133,7 @@ module_apparmor() {
         fi
     else
         log INFO "[DRY RUN] Would configure AppArmor"
+        log INFO "[DRY RUN] Would warn about any profiles promoted from complain to enforce"
     fi
     
     return 0
